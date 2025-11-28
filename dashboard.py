@@ -131,7 +131,7 @@ def generate_patrol_brief_embedded(df_det: pd.DataFrame, df_alerts: pd.DataFrame
     """Uses LLM to generate a patrol brief based on supplied dataframes."""
 
     # 1. Filter and Serialize Data
-    cutoff_time = datetime.now() - timedelta(hours=hours_back)
+    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours_back)
     
     # Safely handle data filtering and conversion
     
