@@ -1,267 +1,276 @@
-from ultralytics import YOLO
+from __future__ import annotations
+
+import csv
+import os
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 import cv2
 import numpy as np
-import requests
-import os
+from inference_sdk import InferenceHTTPClient
+from dotenv import load_dotenv
+from ultralytics import YOLO
 
-# ---------------- CONFIG ----------------
+load_dotenv()
 
-# Set to True to use webcam instead of video file
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
+
 USE_WEBCAM = False
 VIDEO_PATH = "data/test_feed.mp4"
+MODEL_NAME = "yolov8m.pt"
 
-# Local YOLO model
-MODEL_NAME = "yolov8n.pt"
+DETECTION_MODE = "HYBRID"  # YOLO, ROBOFLOW, HYBRID (This is the default setting)
+ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "")
+ROBOFLOW_MODEL_ID = "savanna-animals/2"
+ROBOFLOW_INTERVAL = 15 # frames (Run Roboflow cloud detection every 15 frames)
 
-# Detection engine: "YOLO", "AZURE", "HYBRID"
-DETECTION_MODE = "YOLO"  # change to "AZURE" or "HYBRID" later
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+DETECTION_LOG = LOG_DIR / "detections.csv"
+ALERT_LOG = LOG_DIR / "alerts.csv"
 
-# Azure Computer Vision config (fill these in when you create the resource)
-AZURE_ENDPOINT = os.getenv("AZURE_VISION_ENDPOINT", "https://<your-resource>.cognitiveservices.azure.com")
-AZURE_KEY = os.getenv("AZURE_VISION_KEY", "<your-key-here>")
+# -----------------------------------------------------------------------------
+# CLASS LISTS (for risk scoring)
+# -----------------------------------------------------------------------------
 
-# Your interesting classes (COCO IDs -> names)
-INTERESTING_CLASSES = {
-    0: "person",
-    1: "bicycle",
-    2: "car",
-    3: "motorcycle",
-    4: "airplane",
-    5: "bus",
-    7: "truck",
+PERSON_CLASSES = {"person", "man", "woman", "human"}
+VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "bicycle", "airplane"}
 
-    # Animals (Africa-relevant via COCO)
-    14: "bird",
-    15: "cat",
-    16: "dog",
-    17: "horse",
-    18: "sheep",
-    19: "cow",
-    20: "elephant",
-    22: "zebra",
-    23: "giraffe",
-
-    # Other objects you kept
-    24: "backpack",
-    26: "handbag",
-    28: "suitcase",
-    39: "bottle",
+WILDLIFE_CLASSES = {
+    "elephant", "zebra", "giraffe", "lion", "leopard", "cheetah", 
+    "rhinoceros", "rhino", "buffalo", "hippopotamus", "hippo", "hyena", 
+    "ostrich", "camel", "crocodile", "gazelle", "impala", "antelope", 
+    "baboon", "wildebeest", "warthog", 
 }
 
-# For convenience, build a set of the names we care about
-INTERESTING_NAMES = set(INTERESTING_CLASSES.values())
+# -----------------------------------------------------------------------------
+# ZONE DEFINITIONS (frame coordinates; adjust per feed)
+# -----------------------------------------------------------------------------
+
+ZONES = [
+    {
+        "name": "North Border Line",
+        "type": "border",
+        "polygon": [(100, 80), (520, 80), (520, 140), (100, 140)],
+    },
+    {
+        "name": "Reserve Core",
+        "type": "reserve",
+        "polygon": [(150, 200), (600, 200), (600, 420), (150, 420)],
+    },
+]
+
+# -----------------------------------------------------------------------------
+# UTILITIES
+# -----------------------------------------------------------------------------
+
+def load_model() -> YOLO:
+    print(f"[INFO] Loading YOLO model: {MODEL_NAME}")
+    return YOLO(MODEL_NAME)
 
 
-# ---------------- RISK SCORE ----------------
+def roboflow_available() -> bool:
+    return bool(ROBOFLOW_API_KEY)
 
-def compute_risk_score(detections):
+
+def determine_final_mode(initial_mode: str) -> str:
     """
-    Very simple risk function:
-      - people weighted highest
-      - vehicles + animals contribute to risk
-      - bonus risk if people and animals appear together
+    Determines the effective detection mode based on API key availability.
+    This logic is moved outside of main() to avoid the SyntaxError.
     """
-    num_person = sum(1 for d in detections if d["cls_name"] == "person")
-    num_vehicle = sum(1 for d in detections if d["cls_name"] in ["car", "truck", "bus", "motorcycle", "bicycle", "airplane"])
-    num_animal = sum(1 for d in detections if d["cls_name"] in [
-        "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"
-    ])
-
-    base = num_person * 3 + num_vehicle * 2 + num_animal * 2
-
-    # if people and animals in the same frame, increase risk
-    if num_person > 0 and num_animal > 0:
-        base += 5
-
-    # clip to 0-100
-    return int(max(0, min(100, base)))
+    if initial_mode in {"ROBOFLOW", "HYBRID"} and not roboflow_available():
+        print("[WARNING] ROBOFLOW_API_KEY not found in environment. Switching to YOLO-only mode.")
+        return "YOLO"
+    return initial_mode
 
 
-# ---------------- YOLO DETECTION ----------------
+def point_in_polygon(point: Tuple[float, float], polygon: List[Tuple[int, int]]) -> bool:
+    x, y = point
+    inside = False
+    n = len(polygon)
+    # Standard ray-casting algorithm to check if a point is inside a polygon
+    for i in range(n):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % n]
+        if ((y1 > y) != (y2 > y)) and (
+            x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-6) + x1
+        ):
+            inside = not inside
+    return inside
 
-yolo_model = None  # lazy-load once
+
+def annotate_zones(detections: List[Dict]) -> None:
+    for det in detections:
+        x1, y1, x2, y2 = det["bbox"]
+        center = ((x1 + x2) / 2, (y1 + y2) / 2)
+        det["center"] = center
+        det["zones"] = []
+        for zone in ZONES:
+            if point_in_polygon(center, zone["polygon"]):
+                det["zones"].append(zone["name"])
 
 
-def detect_with_yolo(frame):
-    """
-    Run local YOLO (yolov8n.pt) and return a list of detection dicts.
-    Each detection:
-      { "cls_name": str, "conf": float, "bbox": (x1, y1, x2, y2), "source": "yolo" }
-    """
-    global yolo_model
-    if yolo_model is None:
-        print("[YOLO] Loading model...")
-        yolo_model = YOLO(MODEL_NAME)
-
-    results = yolo_model(frame, verbose=False)
+def detect_with_yolo(model: YOLO, frame: np.ndarray) -> List[Dict]:
+    results = model(frame, verbose=False)
     boxes = results[0].boxes
-
     detections = []
-
-    if boxes is not None and len(boxes) > 0:
-        for box in boxes:
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            cls_id = int(box.cls[0].item())
-            conf = float(box.conf[0].item())
-
-            if cls_id not in INTERESTING_CLASSES:
-                continue
-
-            cls_name = INTERESTING_CLASSES[cls_id]
-
-            detections.append({
-                "cls_name": cls_name,
+    if boxes is None or len(boxes) == 0:
+        return detections
+    for box in boxes:
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        cls_id = int(box.cls[0].item())
+        cls_name = model.names.get(cls_id, "object")
+        conf = float(box.conf[0].item())
+        detections.append(
+            {
+                "cls_name": cls_name.lower(),
                 "conf": conf,
                 "bbox": (x1, y1, x2, y2),
-                "source": "yolo"
-            })
-
+                "source": "yolo",
+            }
+        )
     return detections
 
 
-# ---------------- AZURE DETECTION ----------------
+def detect_with_roboflow(frame: np.ndarray) -> List[Dict]:
+    if not roboflow_available():
+        return []
 
-def _normalize_azure_label(raw_name: str) -> str:
-    """
-    Map Azure object names to our internal class names as best as possible.
-    Azure returns things like 'person', 'car', 'dog', etc.
-    """
-    name = raw_name.lower().strip()
-
-    # direct matches
-    if name in INTERESTING_NAMES:
-        return name
-
-    # simple mappings / startswith for animals & vehicles
-    mapping = {
-        "human": "person",
-        "man": "person",
-        "woman": "person",
-        "boy": "person",
-        "girl": "person",
-        "automobile": "car",
-        "vehicle": "car",
-        "truck": "truck",
-        "bus": "bus",
-        "bicycle": "bicycle",
-        "motorbike": "motorcycle",
-        "motorcycle": "motorcycle",
-        "plane": "airplane",
-        "aeroplane": "airplane",
-        "bike": "bicycle",
-
-        # animals
-        "dog": "dog",
-        "cat": "cat",
-        "bird": "bird",
-        "horse": "horse",
-        "sheep": "sheep",
-        "cow": "cow",
-        "elephant": "elephant",
-        "zebra": "zebra",
-        "giraffe": "giraffe",
-    }
-
-    for key, val in mapping.items():
-        if name == key or name.startswith(key):
-            return val
-
-    # If we don't know it or don't care about it
-    return ""
-
-
-def detect_with_azure(frame):
-    """
-    Call Azure Vision object detection and return detections in same format as YOLO.
-    You MUST configure AZURE_ENDPOINT and AZURE_KEY.
-    """
-    # encode frame as JPEG
     ok, buf = cv2.imencode(".jpg", frame)
     if not ok:
         return []
 
-    img_bytes = buf.tobytes()
-
-    headers = {
-        "Ocp-Apim-Subscription-Key": AZURE_KEY,
-        "Content-Type": "application/octet-stream",
-    }
-
-    # Example endpoint path for object detection (Image Analysis 3.x/4.x)
-    # Adjust to your actual API version
-    url = AZURE_ENDPOINT.rstrip("/") + "/vision/v3.2/detect"
-
     try:
-        resp = requests.post(url, headers=headers, data=img_bytes, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
+        CLIENT = InferenceHTTPClient(
+            api_url="https://infer.roboflow.com",
+            api_key=ROBOFLOW_API_KEY
+        )
+
+        result = CLIENT.infer(
+            buf.tobytes(),
+            model_id=ROBOFLOW_MODEL_ID,
+        )
+
     except Exception as e:
-        print(f"[AZURE ERROR] {e}")
+        print(f"[WARN] Roboflow detection skipped: {e}")
         return []
 
     detections = []
-
-    # Azure returns "objects": [ { "object": name, "confidence": x, "rectangle": {x,y,w,h} }, ... ]
-    for obj in data.get("objects", []):
-        raw_name = obj.get("object", "")
-        conf = float(obj.get("confidence", 0.0))
-        rect = obj.get("rectangle", {})
-
-        cls_name = _normalize_azure_label(raw_name)
-        if not cls_name or cls_name not in INTERESTING_NAMES:
-            continue  # ignore things we don't track
-
-        x = rect.get("x", 0)
-        y = rect.get("y", 0)
-        w = rect.get("w", 0)
-        h = rect.get("h", 0)
-        x1, y1, x2, y2 = x, y, x + w, y + h
+    for pred in result.get("predictions", []):
+        x = pred["x"]
+        y = pred["y"]
+        w = pred["width"]
+        h = pred["height"]
+        
+        x1 = x - w/2
+        y1 = y - h/2
+        x2 = x + w/2
+        y2 = y + h/2
 
         detections.append({
-            "cls_name": cls_name,
-            "conf": conf,
+            "cls_name": pred["class"].lower(),
+            "conf": pred["confidence"],
             "bbox": (x1, y1, x2, y2),
-            "source": "azure"
+            "source": "roboflow"
         })
 
     return detections
 
 
-# ---------------- ROUTER (YOLO / AZURE / HYBRID) ----------------
-
-def get_detections(frame, frame_idx):
-    """
-    Route detection to YOLO, Azure, or both (HYBRID).
-    """
-    if DETECTION_MODE == "YOLO":
-        return detect_with_yolo(frame)
-
-    elif DETECTION_MODE == "AZURE":
-        return detect_with_azure(frame)
-
-    elif DETECTION_MODE == "HYBRID":
-        # Strategy: always run YOLO, and every N frames also call Azure, then merge
-        yolo_dets = detect_with_yolo(frame)
-
-        azure_dets = []
-        # e.g. every 30th frame, call Azure to show cloud integration
-        if frame_idx % 30 == 0:
-            azure_dets = detect_with_azure(frame)
-            print(f"[HYBRID] Azure detected {len(azure_dets)} objects on frame {frame_idx}")
-
-        # Merge (this may double-count if both see the same object, which is okay for MVP)
-        return yolo_dets + azure_dets
-
-    else:
-        return []
+def merge_detections(*det_lists: List[List[Dict]]) -> List[Dict]:
+    merged = []
+    for dets in det_lists:
+        merged.extend(dets)
+    return merged
 
 
-# ---------------- MAIN LOOP ----------------
+def compute_risk_score(detections: List[Dict]) -> int:
+    num_people = sum(1 for d in detections if d["cls_name"] in PERSON_CLASSES)
+    num_vehicles = sum(1 for d in detections if d["cls_name"] in VEHICLE_CLASSES)
+    num_wildlife = sum(1 for d in detections if d["cls_name"] in WILDLIFE_CLASSES)
+
+    base = num_people * 4 + num_vehicles * 3 + num_wildlife * 2
+
+    has_person = num_people > 0
+    has_wildlife = num_wildlife > 0
+    has_vehicle = num_vehicles > 0
+    
+    has_border = any("border" in zone.lower() for d in detections for zone in d.get("zones", []))
+
+    if has_person and has_wildlife:
+        base += 10
+    if has_person and has_vehicle:
+        base += 5
+    if has_border:
+        base += 5
+
+    return int(max(0, min(100, base)))
+    
+
+def write_log(path: Path, row: List):
+    exists = path.exists()
+    with path.open("a", newline="") as f:
+        writer = csv.writer(f)
+        if not exists:
+            writer.writerow(
+                [
+                    "timestamp",
+                    "camera",
+                    "cls_name",
+                    "confidence",
+                    "zones",
+                    "source",
+                ]
+            )
+        writer.writerow(row)
+
+
+def write_alert(message: str, severity: str, data: Dict):
+    exists = ALERT_LOG.exists()
+    with ALERT_LOG.open("a", newline="") as f:
+        writer = csv.writer(f)
+        if not exists:
+            writer.writerow(["timestamp", "severity", "message", "data"])
+        writer.writerow(
+            [
+                datetime.utcnow().isoformat(),
+                severity,
+                message,
+                data,
+            ]
+        )
+
+
+def evaluate_alerts(detections: List[Dict]):
+    for det in detections:
+        if not det.get("zones"):
+            continue
+        for zone in det["zones"]:
+            if "border" in zone.lower() and det["cls_name"] in PERSON_CLASSES:
+                write_alert(
+                    f"Human detected in {zone}",
+                    "high",
+                    {"class": det["cls_name"], "zone": zone},
+                )
+            if "reserve" in zone.lower() and det["cls_name"] in VEHICLE_CLASSES:
+                write_alert(
+                    f"Vehicle inside reserve zone {zone}",
+                    "medium",
+                    {"class": det["cls_name"], "zone": zone},
+                )
+
 
 def main():
-    print(f"[INFO] Detection mode: {DETECTION_MODE}")
+    # --- FIX APPLIED: Determine mode before the main loop starts ---
+    final_detection_mode = determine_final_mode(DETECTION_MODE)
 
-    # Open video source
+    model = load_model()
+
+    # Opening the video source
     if USE_WEBCAM:
         cap = cv2.VideoCapture(0)
     else:
@@ -271,13 +280,12 @@ def main():
         print("Error opening video stream or file")
         return
 
-    print("Starting detection. Press 'ESC' to quit.")
+    print(f"Starting detection in {final_detection_mode} mode. Press 'ESC' to quit.")
     frame_idx = 0
 
     while True:
         ret, frame = cap.read()
 
-        # If using the video file and we reach the end we loop
         if not ret:
             if not USE_WEBCAM:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -285,65 +293,107 @@ def main():
             else:
                 break
 
-        # ---- Get detections from the selected engine(s)
-        detections = get_detections(frame, frame_idx)
+        yolo_dets = []
+        roboflow_dets = []
 
-        # ---- Compute risk score
+        # --- Detection Routing using the fixed mode ---
+        if final_detection_mode in {"YOLO", "HYBRID"}:
+            yolo_dets = detect_with_yolo(model, frame)
+            
+        if final_detection_mode in {"ROBOFLOW", "HYBRID"} and frame_idx % ROBOFLOW_INTERVAL == 0:
+            roboflow_dets = detect_with_roboflow(frame)
+
+        # Merge local and cloud detections
+        detections = merge_detections(yolo_dets, roboflow_dets)
+        
+        # --- Post-Processing & Logging ---
+        annotate_zones(detections)
         risk_score = compute_risk_score(detections)
+        evaluate_alerts(detections)
 
-        # ---- Draw detections
+        timestamp = datetime.utcnow().isoformat()
+        for det in detections:
+            write_log(
+                DETECTION_LOG,
+                [
+                    timestamp,
+                    "TeraWatchCam",
+                    det["cls_name"],
+                    f"{det['conf']:.2f}",
+                    "|".join(det.get("zones", [])),
+                    det["source"],
+                ],
+            )
+            
+        # --- Visualization (OpenCV) ---
         for det in detections:
             x1, y1, x2, y2 = det["bbox"]
             cls_name = det["cls_name"]
             conf = det["conf"]
-            source = det.get("source", "yolo")
+            
+            color = (0, 255, 0) # Default Green
+            if cls_name in PERSON_CLASSES:
+                color = (0, 255, 255) # Yellow
+            elif cls_name in VEHICLE_CLASSES:
+                color = (255, 140, 0) # Orange/Blue
+            elif cls_name in WILDLIFE_CLASSES:
+                color = (0, 0, 255) # Red
 
-            # default color
-            color = (0, 255, 0)
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            label = f"{cls_name} {conf:.2f} ({det['source']})"
+            cv2.putText(
+                frame,
+                label,
+                (int(x1), int(y1) - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+            )
 
-            # humans -> yellow
-            if cls_name == "person":
-                color = (0, 255, 255)
-            # "wildlife-ish" -> red
-            if cls_name in ["horse", "sheep", "cow", "bird", "dog", "cat", "elephant", "bear", "zebra", "giraffe"]:
-                color = (0, 0, 255)
-            # vehicles -> blue
-            if cls_name in ["car", "truck", "bus", "motorcycle", "bicycle", "airplane"]:
-                color = (255, 0, 0)
+        # Draw Zone Polygons
+        for zone in ZONES:
+            pts = np.array(zone["polygon"], dtype=np.int32)
+            cv2.polylines(frame, [pts], True, (255, 255, 255), 1)
+            cv2.putText(
+                frame,
+                zone["name"],
+                pts[0],
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+            )
 
-            # slightly different border for Azure (optional visual cue)
-            thickness = 2 if source == "yolo" else 1
-
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
-            cv2.putText(frame, f"{cls_name} {conf:.2f} ({source})",
-                        (int(x1), int(y1) - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-        # ---- Draw risk score banner
+        # Risk Score Display
         h, w = frame.shape[:2]
-        cv2.rectangle(frame, (0, 0), (w, 40), (0, 0, 0), -1)
-
+        cv2.rectangle(frame, (0, 0), (w, 50), (0, 0, 0), -1)
         if risk_score < 30:
-            risk_color = (0, 255, 0)
+            risk_color = (0, 180, 0)
             risk_label = "LOW"
         elif risk_score < 70:
-            risk_color = (0, 255, 255)
+            risk_color = (0, 200, 255)
             risk_label = "MEDIUM"
         else:
             risk_color = (0, 0, 255)
             risk_label = "HIGH"
+            
+        summary = f"Risk {risk_score:03d} ({risk_label}) | Objects: {len(detections)} | Mode: {final_detection_mode}"
+        cv2.putText(
+            frame,
+            summary,
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            risk_color,
+            2,
+        )
 
-        text = f"Risk Score: {risk_score} ({risk_label})   |   Objects: {len(detections)}"
-        cv2.putText(frame, text, (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, risk_color, 2)
-
-        cv2.imshow("TeraWatch - YOLO/Azure Hybrid Detection & Risk", frame)
-
-        # ESC to quit
+        cv2.imshow("TeraWatch Surveillance", frame)
+        
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             break
-
         frame_idx += 1
 
     cap.release()
