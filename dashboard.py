@@ -4,23 +4,27 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import plotly.express as px
-import openai
+from openai import OpenAI # Ensure this is the only OpenAI import
 import os
 from dotenv import load_dotenv
 from typing import Dict
+import openai # For catching specific API errors
 
 # --- LLM SETUP ---
 # Use Streamlit's native secrets management for deployment
 try:
-    # Check if the key exists in the Streamlit Secrets (for cloud deployment)
-    # This is the recommended way for Streamlit Cloud
-    openai.api_key = st.secrets["OPENAI_API_KEY"]
+    # Instantiate the client using the key from Streamlit Secrets
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 except (AttributeError, KeyError):
-    # Fallback for local testing or if secrets are missing
-    import os
-    from dotenv import load_dotenv
-    load_dotenv()
-    openai.api_key = os.getenv("OPENAI_API_KEY")
+    # Fallback for local testing (using python-dotenv)
+    # Note: If running locally without .env, this will raise a value error.
+    if Path(".env").exists():
+        load_dotenv()
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    else:
+        # Create a dummy client to avoid crash if keys are missing during development
+        # The AI report function will handle the actual API error
+        client = OpenAI(api_key="DUMMY_KEY_FOR_LOCAL_DEV") 
 
 
 # Configuration
@@ -41,7 +45,8 @@ WILDLIFE_CLASSES = {
 
 # --- Utility Functions ---
 
-@st.cache_data(ttl=REFRESH_RATE)
+# Removed ttl=REFRESH_RATE because we are removing the auto-loop structure
+@st.cache_data(show_spinner=False) 
 def load_data():
     """Reads the latest data from the CSV logs."""
     data = {}
@@ -55,7 +60,6 @@ def load_data():
         except pd.errors.EmptyDataError:
             data['detections'] = pd.DataFrame(columns=['timestamp', 'camera', 'cls_name', 'confidence', 'zones', 'source'])
         except Exception:
-            # Handle potential partial writes or other file errors gracefully
             data['detections'] = pd.DataFrame(columns=['timestamp', 'camera', 'cls_name', 'confidence', 'zones', 'source'])
     else:
         data['detections'] = pd.DataFrame(columns=['timestamp', 'camera', 'cls_name', 'confidence', 'zones', 'source'])
@@ -155,7 +159,7 @@ def generate_patrol_brief_embedded(df_det: pd.DataFrame, df_alerts: pd.DataFrame
     if recent_det.strip().startswith("No detection data recorded."):
         return f"### ⚠️ No Data Available\nReport generation skipped: No detection data recorded in the last {hours_back} hours."
 
-    # 2. Create the LLM Prompt (Removed ellipses)
+    # 2. Create the LLM Prompt
     prompt = f"""
     Analyze the following surveillance log data from the TeraWatch AI system over the last {hours_back} hours.
     --- DETECTION LOG DATA (Last {hours_back} hours) ---
@@ -170,9 +174,9 @@ def generate_patrol_brief_embedded(df_det: pd.DataFrame, df_alerts: pd.DataFrame
     4. **Overall Risk Profile**: State the activity level (Low/Medium/High) for the period.
     """
     
-    # 3. Call the LLM API (Removed ellipses)
+    # 3. Call the LLM API
     try:
-        response = openai.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-4-turbo", 
             messages=[
                 {"role": "system", "content": "You are an expert wildlife and border security analyst. Format your response strictly in Markdown with headings."},
@@ -190,7 +194,7 @@ def generate_patrol_brief_embedded(df_det: pd.DataFrame, df_alerts: pd.DataFrame
     except Exception as e:
         return f"### 💔 UNEXPECTED ERROR\nAn unknown error occurred during API communication: {e}"
     
-# --- Streamlit App ---
+# --- Streamlit App Execution ---
 
 st.set_page_config(
     page_title="TeraWatch AI Surveillance Dashboard",
@@ -201,190 +205,177 @@ st.set_page_config(
 st.title("🦁 TeraWatch AI Reserve Surveillance Dashboard")
 st.markdown("---")
 
+# Load data at the beginning of the script run (Streamlit's default behavior)
+data = load_data()
+df_det = data['detections']
+df_alert = data['alerts']
+
 # Initialize session state for the report only once
 if 'report_text' not in st.session_state:
     st.session_state['report_text'] = "Press the button below to generate the latest 24-hour patrol report."
 if 'report_hours' not in st.session_state:
     st.session_state['report_hours'] = 24
 
-# Use a container to auto-refresh the data
-placeholder = st.empty()
+# Calculate metrics based on the current data
+risk_score, risk_label = calculate_risk_score(df_det)
+risk_color = get_risk_color(risk_label)
 
-# Main loop to continuously refresh the dashboard
-while True:
-    data = load_data()
-    df_det = data['detections']
-    df_alert = data['alerts']
-    
-    risk_score, risk_label = calculate_risk_score(df_det)
-    risk_color = get_risk_color(risk_label)
-    
-    with placeholder.container():
-        # 1. KEY PERFORMANCE INDICATORS (KPIs)
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.markdown(f"""
-            <div style='background-color:{risk_color}; padding: 10px; border-radius: 5px; text-align: center;'>
-                <h3 style='color: black; margin: 0;'>RISK LEVEL</h3>
-                <h1 style='color: black; margin: 0;'>{risk_label} ({risk_score}%)</h1>
-            </div>
-            """, unsafe_allow_html=True)
+# 1. KEY PERFORMANCE INDICATORS (KPIs)
+col1, col2, col3, col4 = st.columns(4)
 
-        with col2:
-            st.metric(
-                label="Total Objects Logged", 
-                value=len(df_det)
-            )
+with col1:
+    st.markdown(f"""
+    <div style='background-color:{risk_color}; padding: 10px; border-radius: 5px; text-align: center;'>
+        <h3 style='color: black; margin: 0;'>RISK LEVEL</h3>
+        <h1 style='color: black; margin: 0;'>{risk_label} ({risk_score}%)</h1>
+    </div>
+    """, unsafe_allow_html=True)
 
-        with col3:
-            # Check alerts within the last hour
-            recent_alerts = df_alert[df_alert['timestamp'] >= datetime.now() - pd.Timedelta(hours=1)]
-            alert_delta = None
-            if not recent_alerts.empty:
-                if 'high' in recent_alerts['severity'].str.lower().values:
-                    alert_delta = "HIGH"
-                elif 'medium' in recent_alerts['severity'].str.lower().values: # <-- COLON ADDED HERE
-                    alert_delta = "MEDIUM"
-                else:
-                    alert_delta = "LOW"
+with col2:
+    st.metric(
+        label="Total Objects Logged", 
+        value=len(df_det)
+    )
 
-            st.metric(
-                label="Alerts (Last 1 Hr)", 
-                value=len(recent_alerts),
-                delta=alert_delta # Show the highest severity
-            )
+with col3:
+    # Check alerts within the last hour
+    recent_alerts = df_alert[df_alert['timestamp'] >= datetime.now() - pd.Timedelta(hours=1)]
+    alert_delta = None
+    if not recent_alerts.empty:
+        if 'high' in recent_alerts['severity'].str.lower().values:
+            alert_delta = "HIGH"
+        elif 'medium' in recent_alerts['severity'].str.lower().values:
+            alert_delta = "MEDIUM"
+        else:
+            alert_delta = "LOW"
 
-        with col4:
-            st.metric(
-                label="Data Source Mode", 
-                value="Hybrid (YOLO/RF)",
-                delta=f"Last refresh: {datetime.now().strftime('%H:%M:%S')}"
-            )
-        
-        st.markdown("---")
+    st.metric(
+        label="Alerts (Last 1 Hr)", 
+        value=len(recent_alerts),
+        delta=alert_delta # Show the highest severity
+    )
 
-        # 2. ALERTS AND LOGS (Two Columns)
-        col_alert, col_log = st.columns([1, 2])
+with col4:
+    st.metric(
+        label="Data Source Mode", 
+        value="Hybrid (YOLO/RF)",
+        delta=f"Last refresh: {datetime.now().strftime('%H:%M:%S')}"
+    )
 
-        with col_alert:
-            st.subheader("🚨 Real-time Alerts")
-            if not df_alert.empty:
-                # Show only the most recent alerts
-                recent_alerts_display = df_alert.tail(10).sort_values(by='timestamp', ascending=False)
-                st.dataframe(
-                    recent_alerts_display[['timestamp', 'severity', 'message']],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.info("No alerts recorded yet.")
-                
-        with col_log:
-            st.subheader("📊 Detections Over Time")
-            
-            if not df_det.empty:
-                # Group data by 1-minute intervals and count
-                df_det_agg = (
-                    df_det.set_index('timestamp')
-                    .resample('1min')['cls_name']
-                    .count()
-                    .reset_index(name='count')
-                )
-                
-                # Create a line chart
-                fig = px.line(
-                    df_det_agg, 
-                    x='timestamp', 
-                    y='count', 
-                    title='Detection Volume per Minute'
-                )
-                fig.update_layout(xaxis_title="Time", yaxis_title="Number of Objects")
-                
-                # --- FIX APPLIED: Dynamic key
-                st.plotly_chart(fig, use_container_width=True, key=f"line_{time.time()}")
-            else:
-                st.info("No detection data recorded yet.")
-        
-        st.markdown("---")
+st.markdown("---")
 
-        # 3. CLASS BREAKDOWN
-        st.subheader("🔍 Class and Source Analysis")
-        
-        col_pie, col_bar = st.columns(2)
-        
-        if not df_det.empty:
-            with col_pie:
-                # Pie chart for top classes
-                class_counts = df_det['cls_name'].value_counts().reset_index()
-                class_counts.columns = ['Class', 'Count']
-                fig_pie = px.pie(
-                    class_counts.head(10), 
-                    values='Count', 
-                    names='Class', 
-                    title='Top 10 Detected Object Classes'
-                )
-                # --- FIX APPLIED: Dynamic key
-                st.plotly_chart(fig_pie, use_container_width=True, key=f"pie_{time.time()}")
+# 2. ALERTS AND LOGS (Two Columns)
+col_alert, col_log = st.columns([1, 2])
 
-            with col_bar:
-                # Bar chart for source comparison
-                source_counts = df_det['source'].value_counts().reset_index()
-                source_counts.columns = ['Source', 'Count']
-                fig_bar = px.bar(
-                    source_counts, 
-                    x='Source', 
-                    y='Count', 
-                    color='Source',
-                    title='Detections by Source (YOLO vs Roboflow)'
-                )
-                # --- FIX APPLIED: Dynamic key
-                st.plotly_chart(fig_bar, use_container_width=True, key=f"bar_{time.time()}")
-        
-        # Display raw data tables for debugging/detailed inspection
-        with st.expander("Show Raw Data Logs"):
-            st.subheader("Recent Detections Log")
-            st.dataframe(df_det.tail(20).sort_values(by='timestamp', ascending=False), use_container_width=True)
-            
-            st.subheader("Alerts Log")
-            st.dataframe(df_alert.sort_values(by='timestamp', ascending=False), use_container_width=True)
-
-        # 4. REPORT GENERATION SECTION
-        st.subheader("📄 AI-Powered Patrol Brief")
-        
-        report_col, hours_col = st.columns([2, 1])
-
-        # Selector for report hours
-        selected_hours = hours_col.selectbox(
-            "Report History (Hours)", 
-            options=[6, 12, 24, 48, 72], 
-            index=2, # Default to 24 hours
-            key='report_hours_selector'
+with col_alert:
+    st.subheader("🚨 Real-time Alerts")
+    if not df_alert.empty:
+        # Show only the most recent alerts
+        recent_alerts_display = df_alert.tail(10).sort_values(by='timestamp', ascending=False)
+        st.dataframe(
+            recent_alerts_display[['timestamp', 'severity', 'message']],
+            use_container_width=True,
+            hide_index=True,
         )
-
-        # Button to trigger the report generation
-        if report_col.button(f"Generate AI Patrol Brief for Last {selected_hours} Hours", type="primary"):
-            # Update the hours used for the next report
-            st.session_state['report_hours'] = selected_hours
-            
-            with st.spinner(f"Contacting OpenAI (gpt-4-turbo) and analyzing {selected_hours} hours of logs..."):
-                # Call the generator function with the data loaded at the start of the loop
-                report = generate_patrol_brief_embedded(df_det, df_alert, hours_back=selected_hours)
-                st.session_state['report_text'] = report
-                
-        # Display the report from session state
-        st.markdown(st.session_state['report_text'])
+    else:
+        st.info("No alerts recorded yet.")
         
-        st.markdown("---")
+with col_log:
+    st.subheader("📊 Detections Over Time")
+    
+    if not df_det.empty:
+        # Group data by 1-minute intervals and count
+        df_det_agg = (
+            df_det.set_index('timestamp')
+            .resample('1min')['cls_name']
+            .count()
+            .reset_index(name='count')
+        )
         
-        # Display raw data tables for debugging/detailed inspection
-        with st.expander("Show Raw Data Logs (For Debugging)"):
-            st.subheader("Recent Detections Log")
-            st.dataframe(df_det.tail(20).sort_values(by='timestamp', ascending=False), use_container_width=True)
-            
-            st.subheader("Alerts Log")
-            st.dataframe(df_alert.sort_values(by='timestamp', ascending=False), use_container_width=True)
+        # Create a line chart
+        fig = px.line(
+            df_det_agg, 
+            x='timestamp', 
+            y='count', 
+            title='Detection Volume per Minute'
+        )
+        fig.update_layout(xaxis_title="Time", yaxis_title="Number of Objects")
+        
+        # NOTE: Dynamic key is no longer needed without the while True loop!
+        st.plotly_chart(fig, use_container_width=True) 
+    else:
+        st.info("No detection data recorded yet.")
 
+st.markdown("---")
 
-    # Wait for the specified refresh rate
-    time.sleep(REFRESH_RATE)
+# 3. CLASS BREAKDOWN
+st.subheader("🔍 Class and Source Analysis")
+
+col_pie, col_bar = st.columns(2)
+
+if not df_det.empty:
+    with col_pie:
+        # Pie chart for top classes
+        class_counts = df_det['cls_name'].value_counts().reset_index()
+        class_counts.columns = ['Class', 'Count']
+        fig_pie = px.pie(
+            class_counts.head(10), 
+            values='Count', 
+            names='Class', 
+            title='Top 10 Detected Object Classes'
+        )
+        # NOTE: Dynamic key is no longer needed
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    with col_bar:
+        # Bar chart for source comparison
+        source_counts = df_det['source'].value_counts().reset_index()
+        source_counts.columns = ['Source', 'Count']
+        fig_bar = px.bar(
+            source_counts, 
+            x='Source', 
+            y='Count', 
+            color='Source',
+            title='Detections by Source (YOLO vs Roboflow)'
+        )
+        # NOTE: Dynamic key is no longer needed
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+# 4. REPORT GENERATION SECTION
+st.subheader("📄 AI-Powered Patrol Brief")
+
+report_col, hours_col = st.columns([2, 1])
+
+# Selector for report hours
+selected_hours = hours_col.selectbox(
+    "Report History (Hours)", 
+    options=[6, 12, 24, 48, 72], 
+    index=2, # Default to 24 hours
+    key='report_hours_selector'
+)
+
+# Button to trigger the report generation
+if report_col.button(f"Generate AI Patrol Brief for Last {selected_hours} Hours", type="primary"):
+    # Update the hours used for the next report
+    st.session_state['report_hours'] = selected_hours
+    
+    with st.spinner(f"Contacting OpenAI (gpt-4-turbo) and analyzing {selected_hours} hours of logs..."):
+        # Call the generator function with the data loaded at the start of the script
+        report = generate_patrol_brief_embedded(df_det, df_alert, hours_back=selected_hours)
+        st.session_state['report_text'] = report
+        
+# Display the report from session state
+st.markdown(st.session_state['report_text'])
+
+st.markdown("---")
+
+# Display raw data tables for debugging/detailed inspection
+with st.expander("Show Raw Data Logs (For Debugging)"):
+    st.subheader("Recent Detections Log")
+    st.dataframe(df_det.tail(20).sort_values(by='timestamp', ascending=False), use_container_width=True)
+    
+    st.subheader("Alerts Log")
+    st.dataframe(df_alert.sort_values(by='timestamp', ascending=False), use_container_width=True)
+
+# NOTE: The entire app will now refresh automatically when data changes (e.g., button press)
+# or when Streamlit's internal mechanism detects file changes.
