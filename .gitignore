@@ -15,3 +15,6 @@ logs/
 # Secrets
 .env
 *.env
+venv/
+.env
+logs/
