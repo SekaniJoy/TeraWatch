@@ -193,23 +193,32 @@ def compute_risk_score(detections: List[Dict]) -> int:
     num_vehicles = sum(1 for d in detections if d["cls_name"] in VEHICLE_CLASSES)
     num_wildlife = sum(1 for d in detections if d["cls_name"] in WILDLIFE_CLASSES)
 
+    # Base risk calculation (Weights are: People=4, Vehicle=3, Wildlife=2)
     base = num_people * 4 + num_vehicles * 3 + num_wildlife * 2
 
+    # Interaction and Intrusion modifiers
     has_person = num_people > 0
     has_wildlife = num_wildlife > 0
     has_vehicle = num_vehicles > 0
-    
+    # Check if ANY detection falls into a 'border' zone
     has_border = any("border" in zone.lower() for d in detections for zone in d.get("zones", []))
 
+    # High-Risk Interaction: Human-Wildlife Conflict
     if has_person and has_wildlife:
-        base += 10
+        base += 10 # Major risk modifier
+    
+    # Medium-Risk Interaction: Unauthorized Vehicle/Person in Proximity
     if has_person and has_vehicle:
-        base += 5
-    if has_border:
-        base += 5
+        base += 5 # Indicates human presence with means of transport
 
+    # Intrusion Risk: Any presence near the defined border
+    if has_border:
+        base += 5 # Indicates a perimeter breach/monitoring need
+
+    # Scale score to 0-100 (clamp at 100)
     return int(max(0, min(100, base)))
     
+
 
 def write_log(path: Path, row: List):
     exists = path.exists()
@@ -331,6 +340,7 @@ def main():
             cls_name = det["cls_name"]
             conf = det["conf"]
             
+            # Color-coding for visualization
             color = (0, 255, 0) # Default Green
             if cls_name in PERSON_CLASSES:
                 color = (0, 255, 255) # Yellow
@@ -339,6 +349,7 @@ def main():
             elif cls_name in WILDLIFE_CLASSES:
                 color = (0, 0, 255) # Red
 
+            # Ensure coordinates are integers
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
             label = f"{cls_name} {conf:.2f} ({det['source']})"
             cv2.putText(
@@ -377,7 +388,6 @@ def main():
         else:
             risk_color = (0, 0, 255)
             risk_label = "HIGH"
-            
         summary = f"Risk {risk_score:03d} ({risk_label}) | Objects: {len(detections)} | Mode: {final_detection_mode}"
         cv2.putText(
             frame,
@@ -391,6 +401,8 @@ def main():
 
         cv2.imshow("TeraWatch Surveillance", frame)
         
+
+        # ESC to quit
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             break

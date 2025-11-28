@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import plotly.express as px
 import openai
@@ -13,6 +13,7 @@ from typing import Dict
 # Use Streamlit's native secrets management for deployment
 try:
     # Check if the key exists in the Streamlit Secrets (for cloud deployment)
+    # This is the recommended way for Streamlit Cloud
     openai.api_key = st.secrets["OPENAI_API_KEY"]
 except (AttributeError, KeyError):
     # Fallback for local testing or if secrets are missing
@@ -130,9 +131,32 @@ def generate_patrol_brief_embedded(df_det: pd.DataFrame, df_alerts: pd.DataFrame
     """Uses LLM to generate a patrol brief based on supplied dataframes."""
 
     # 1. Filter and Serialize Data
-    # Use timezone-aware comparison if logs are UTC (which they are)
     cutoff_time = datetime.now() - timedelta(hours=hours_back)
-…    prompt = f"""
+    
+    # Safely handle data filtering and conversion
+    
+    # Detections
+    if 'timestamp' in df_det.columns and not df_det.empty:
+        df_det_copy = df_det.copy()
+        df_det_copy['timestamp'] = pd.to_datetime(df_det_copy['timestamp'], errors='coerce', utc=True)
+        recent_det = df_det_copy[df_det_copy['timestamp'] >= cutoff_time].dropna(subset=['timestamp']).to_string()
+    else:
+        recent_det = "No detection data recorded."
+        
+    # Alerts
+    if 'timestamp' in df_alerts.columns and not df_alerts.empty:
+        df_alerts_copy = df_alerts.copy()
+        df_alerts_copy['timestamp'] = pd.to_datetime(df_alerts_copy['timestamp'], errors='coerce', utc=True)
+        recent_alerts = df_alerts_copy[df_alerts_copy['timestamp'] >= cutoff_time].dropna(subset=['timestamp']).to_string()
+    else:
+        recent_alerts = "No alerts recorded."
+
+    # Data check
+    if recent_det.strip().startswith("No detection data recorded."):
+        return f"### ⚠️ No Data Available\nReport generation skipped: No detection data recorded in the last {hours_back} hours."
+
+    # 2. Create the LLM Prompt (Removed ellipses)
+    prompt = f"""
     Analyze the following surveillance log data from the TeraWatch AI system over the last {hours_back} hours.
     --- DETECTION LOG DATA (Last {hours_back} hours) ---
     {recent_det}
@@ -142,7 +166,13 @@ def generate_patrol_brief_embedded(df_det: pd.DataFrame, df_alerts: pd.DataFrame
     Generate a professional 'Wildlife Reserve Patrol Brief' in Markdown format, including these sections: 
     1. **Summary of High-Risk Intrusions**: Detail any human or vehicle activity in 'border' or 'reserve' zones.
     2. **Key Wildlife Observations**: Note the most frequently detected wildlife and their locations.
-…        response = openai.chat.completions.create(
+    3. **Actionable Recommendations**: Suggest a high-priority patrol route or time window based on alert frequency and human/vehicle presence.
+    4. **Overall Risk Profile**: State the activity level (Low/Medium/High) for the period.
+    """
+    
+    # 3. Call the LLM API (Removed ellipses)
+    try:
+        response = openai.chat.completions.create(
             model="gpt-4-turbo", 
             messages=[
                 {"role": "system", "content": "You are an expert wildlife and border security analyst. Format your response strictly in Markdown with headings."},
@@ -158,7 +188,7 @@ def generate_patrol_brief_embedded(df_det: pd.DataFrame, df_alerts: pd.DataFrame
     except openai.APIError as e:
         return f"### 🔴 API ERROR\nOpenAI API failed. Check model access (gpt-4-turbo) or key. Error: {e}"
     except Exception as e:
-        return f"### 💔 UNEXPECTED ERROR\nAn unknown error occurred during API communication: {e}"""
+        return f"### 💔 UNEXPECTED ERROR\nAn unknown error occurred during API communication: {e}"
     
 # --- Streamlit App ---
 
@@ -214,7 +244,7 @@ while True:
             if not recent_alerts.empty:
                 if 'high' in recent_alerts['severity'].str.lower().values:
                     alert_delta = "HIGH"
-                elif 'medium' in recent_alerts['severity'].str.lower().values
+                elif 'medium' in recent_alerts['severity'].str.lower().values: # <-- COLON ADDED HERE
                     alert_delta = "MEDIUM"
                 else:
                     alert_delta = "LOW"

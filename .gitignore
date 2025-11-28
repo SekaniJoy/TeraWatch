@@ -8,9 +8,7 @@ venv/
 # Local big files
 data/*.mp4
 
-# Logs and local CSVs
-logs/
-*.csv
+
 
 # Secrets
 .env
