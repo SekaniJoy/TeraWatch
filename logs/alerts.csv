@@ -50,3 +50,4 @@ timestamp,severity,message,data
 2025-11-28T15:42:32.585483,medium,Vehicle inside reserve zone Reserve Core,"{'class': 'airplane', 'zone': 'Reserve Core'}"
 2025-11-28T15:42:32.752541,medium,Vehicle inside reserve zone Reserve Core,"{'class': 'airplane', 'zone': 'Reserve Core'}"
 2025-11-28T15:42:32.913675,medium,Vehicle inside reserve zone Reserve Core,"{'class': 'airplane', 'zone': 'Reserve Core'}"
+2025-11-28T15:53:58.937278,medium,Vehicle inside reserve zone Reserve Core,"{'class': 'airplane', 'zone': 'Reserve Core'}"
